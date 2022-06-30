@@ -192,6 +192,11 @@ impl<Tag> ObjectStore<Tag> {
         }
     }
 
+    /// Iterates over all the buffer indexes that exist inside this object store.
+    pub fn iter_buffers<'a>(&'a self) -> impl Iterator<Item = u32> + 'a {
+        0..(self.inner.buffers.len() as u32)
+    }
+
     /// Pushes a new object to the given buffer and returns a handle for it. Any [`u32`] can be
     /// chosen as the `buffer_ix` but bear in mind that a large choice of index will cause a large
     /// allocation to happen if smaller buffer indexes have not yet been used.
