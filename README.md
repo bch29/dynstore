@@ -27,9 +27,9 @@ primary key to speed up searching.
 # Caveats
 
 The motivating use case is to store objects that live for the entire lifetime of the program.
-Thus, once objects are pushed to the [`ObjectStore`], they are not dropped until the whole
+Thus, once objects are pushed to the `ObjectStore`, they are not dropped until the whole
 store is dropped. Due to the way handles are implemented, there is also a limitation that at
-most 2^32 [`ObjectStore`] instances can be created over the whole life of a program. This might
+most 2^32 `ObjectStore` instances can be created over the whole life of a program. This might
 limit some use cases as a temporary arena allocator.
 
 Pushing objects into the store is not fast enough to do in a hot loop. It involves a hash
