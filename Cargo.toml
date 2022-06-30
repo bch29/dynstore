@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "A container for arbitrary castable objects"
 license = "MIT"
-documentation = "docs.rs/dynstore"
-repository = "github.com/bch29/dynstore"
+documentation = "https://docs.rs/dynstore"
+repository = "https://github.com/bch29/dynstore"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
