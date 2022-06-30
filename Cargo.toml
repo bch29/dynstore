@@ -11,7 +11,7 @@ repository = "https://github.com/bch29/dynstore"
 
 [dependencies]
 inventory = { version = "0.2.*", optional = true }
-once_cell = "*"
+once_cell = "1.*"
 
 [features]
 inventory = ["dep:inventory"]
