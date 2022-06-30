@@ -99,6 +99,10 @@ pub mod tag {
 /// See the module documentation for more info.
 pub struct ObjectStore<Tag = tag::Send> {
     _marker: std::marker::PhantomData<Tag>,
+    inner: ObjectStoreInner,
+}
+
+struct ObjectStoreInner {
     id: u32,
     metas: Vec<ObjectMeta>,
     casts: Casts,
@@ -163,29 +167,9 @@ impl ObjectStore<tag::SendSync> {
 impl<Tag> ObjectStore<Tag> {
     /// Instantiates a new [`ObjectStore`] object.
     pub fn new() -> Self {
-        static NEXT_ID: once_cell::sync::OnceCell<Mutex<u32>> = once_cell::sync::OnceCell::new();
-        let mut next_id = NEXT_ID.get_or_init(|| Mutex::new(0)).lock().unwrap();
-
-        if *next_id == std::u32::MAX {
-            panic!(
-                "total number of [`ObjectStore`] instances over the life of the program reached
-                   {} so no more stores can be created",
-                *next_id
-            );
-        }
-
-        let id = *next_id;
-        *next_id += 1;
-
         ObjectStore {
             _marker: std::marker::PhantomData,
-            id,
-            casts: Default::default(),
-            metas: Default::default(),
-            metas_by_type: Default::default(),
-            metas_by_cast_target: Default::default(),
-            object_keys: Default::default(),
-            buffers: Default::default(),
+            inner: ObjectStoreInner::new(),
         }
     }
 
@@ -196,40 +180,7 @@ impl<Tag> ObjectStore<Tag> {
     where
         T: Castable + tag::Satisfies<Tag>,
     {
-        let meta_ix = *self
-            .metas_by_type
-            .entry(TypeId::of::<T>())
-            .or_insert_with(|| {
-                let meta = ObjectMeta::new::<T>();
-                let ix = self.metas.len() as u32;
-                self.metas.push(meta);
-                T::collect_casts(&mut self.casts);
-
-                for (dst, _) in self.casts.find_keys_by_src(TypeId::of::<T>()) {
-                    self.metas_by_cast_target.insert((dst, ix));
-                }
-
-                ix
-            });
-
-        while self.buffers.len() <= buffer_ix as usize {
-            self.buffers.push(Default::default());
-        }
-
-        let buffer = &mut self.buffers[buffer_ix as usize];
-        let (ptr, offset) = buffer.allocate(item);
-
-        self.object_keys.insert(ObjectKey {
-            buffer_ix,
-            meta_ix,
-            offset,
-        });
-
-        Handle {
-            store_id: self.id,
-            meta_ix,
-            ptr,
-        }
+        self.inner.push(buffer_ix, item)
     }
 
     /// Iterates over handles for all stored objects in the given buffer that are castable to the
@@ -238,8 +189,7 @@ impl<Tag> ObjectStore<Tag> {
     where
         T: ?Sized + 'static,
     {
-        self.find_dynamic(buffer_ix, TypeId::of::<T>())
-            .flat_map(|handle| self.cast_from_dynamic::<T>(handle))
+        self.inner.find::<T>(buffer_ix)
     }
 
     /// Iterates over dynamic handles for all stored objects in the given buffer that are castable
@@ -250,29 +200,7 @@ impl<Tag> ObjectStore<Tag> {
         buffer_ix: u32,
         type_id: TypeId,
     ) -> impl Iterator<Item = DynamicHandle> + 'a {
-        self.metas_by_cast_target
-            .range((type_id, 0)..=(type_id, std::u32::MAX))
-            .flat_map(move |&(_, meta_ix)| {
-                self.object_keys
-                    .range(
-                        ObjectKey {
-                            buffer_ix,
-                            meta_ix,
-                            offset: (0, 0),
-                        }..ObjectKey {
-                            buffer_ix,
-                            meta_ix: 1 + meta_ix,
-                            offset: (0, 0),
-                        },
-                    )
-                    .map(move |key| DynamicHandle {
-                        inner: Handle {
-                            store_id: self.id,
-                            meta_ix: key.meta_ix,
-                            ptr: self.buffers[key.buffer_ix as usize].offset(key.offset),
-                        },
-                    })
-            })
+        self.inner.find_dynamic(buffer_ix, type_id)
     }
 
     /// Casts an untyped `DynamicHandle` up to a typed `Handle`. Panics if the input handle is not
@@ -282,14 +210,7 @@ impl<Tag> ObjectStore<Tag> {
     where
         T: ?Sized + 'static,
     {
-        let meta = &self.metas[handle.inner.meta_ix as usize];
-        let cast_ix = self.casts.find_key(meta.type_id, TypeId::of::<T>())?;
-
-        Some(Handle {
-            store_id: handle.inner.store_id,
-            meta_ix: handle.inner.meta_ix,
-            ptr: self.casts.cast(cast_ix, handle.inner.ptr),
-        })
+        self.inner.cast_from_dynamic(handle)
     }
 
     /// Casts a handle down to an untyped DynamicHandle. Panics if the input handle is not
@@ -298,14 +219,7 @@ impl<Tag> ObjectStore<Tag> {
     where
         T: ?Sized + 'static,
     {
-        assert_eq!(handle.store_id, self.id);
-        DynamicHandle {
-            inner: Handle {
-                meta_ix: handle.meta_ix,
-                store_id: self.id,
-                ptr: handle.ptr as *const (),
-            },
-        }
+        self.inner.cast_to_dynamic(handle)
     }
 
     /// Casts a handle to a different type. Panics if the input handle is not associated with this
@@ -316,7 +230,7 @@ impl<Tag> ObjectStore<Tag> {
         T: ?Sized + 'static,
         U: ?Sized + 'static,
     {
-        self.cast_from_dynamic(self.cast_to_dynamic(handle))
+        self.inner.cast(handle)
     }
 
     /// Accesses an object reference through a handle. Panics if the handle is not associated
@@ -326,13 +240,7 @@ impl<Tag> ObjectStore<Tag> {
     where
         T: ?Sized + 'static,
     {
-        assert_eq!(handle.store_id, self.id);
-
-        // SAFETY: Since we have checked that the handle's store id matches our id, the handle can
-        // only have been acquired from this store instance. Objects within the store are never
-        // removed or moved around in buffers, so reading this type from this handle's pointer is
-        // guaranteed to be valid.
-        unsafe { &*handle.ptr }
+        self.inner.get(handle)
     }
 
     /// Accesses a mutable object reference through a handle. Panics if the handle is not
@@ -342,16 +250,7 @@ impl<Tag> ObjectStore<Tag> {
     where
         T: ?Sized + 'static,
     {
-        assert_eq!(handle.store_id, self.id);
-
-        // SAFETY: Since we have checked that the handle's store id matches our id, the handle can
-        // only have been acquired from this store instance. Objects within the store are never
-        // removed or moved around in buffers, so reading this type from this handle's pointer is
-        // guaranteed to be valid.
-        //
-        // It is safe to form the mutable reference because we have a mutable reference to `self`
-        // guaranteeing that nothing else can be referencing anything inside `self`.
-        unsafe { &mut *(handle.ptr as *mut T) }
+        self.inner.get_mut(handle)
     }
 
     /// Returns the [`TypeId`] of the concrete type stored at the given handle. The returned type
@@ -361,15 +260,13 @@ impl<Tag> ObjectStore<Tag> {
     where
         T: ?Sized,
     {
-        assert_eq!(handle.store_id, self.id);
-        self.metas[handle.meta_ix as usize].type_id
+        self.inner.get_type_id(handle)
     }
 
     /// Returns the [`TypeId`] of the concrete type stored at the given handle. Panics if the input
     /// handle is not associated with this `ObjectStore`.
     pub fn get_type_id_dynamic(&self, handle: DynamicHandle) -> TypeId {
-        assert_eq!(handle.inner.store_id, self.id);
-        self.metas[handle.inner.meta_ix as usize].type_id
+        self.inner.get_type_id_dynamic(handle)
     }
 
     /// Gets the name of the type stored at the given handle. Panics if the input handle is not
@@ -378,19 +275,17 @@ impl<Tag> ObjectStore<Tag> {
     where
         T: ?Sized,
     {
-        assert_eq!(handle.store_id, self.id);
-        self.metas[handle.meta_ix as usize].name.as_str()
+        self.inner.get_type_name(handle)
     }
 
     /// Gets the name of the type stored at the given dynamic handle. Panics if the input handle is
     /// not associated with this `ObjectStore`.
     pub fn get_type_name_dynamic(&self, handle: DynamicHandle) -> &str {
-        assert_eq!(handle.inner.store_id, self.id);
-        self.metas[handle.inner.meta_ix as usize].name.as_str()
+        self.inner.get_type_name_dynamic(handle)
     }
 }
 
-impl<Tag> Drop for ObjectStore<Tag> {
+impl Drop for ObjectStoreInner {
     fn drop(&mut self) {
         for key in &self.object_keys {
             let ptr = self.buffers[key.buffer_ix as usize].offset_mut(key.offset);
@@ -505,6 +400,206 @@ where
 {
     let ptr = ptr as *mut T;
     std::ptr::drop_in_place(ptr);
+}
+
+fn new_store_id() -> u32 {
+    static NEXT_ID: once_cell::sync::OnceCell<Mutex<u32>> = once_cell::sync::OnceCell::new();
+    let mut next_id = NEXT_ID.get_or_init(|| Mutex::new(0)).lock().unwrap();
+
+    if *next_id == std::u32::MAX {
+        panic!(
+            "total number of [`ObjectStore`] instances over the life of the program reached {} so
+            no more stores can be created",
+            *next_id
+        );
+    }
+
+    let id = *next_id;
+    *next_id += 1;
+    id
+}
+
+impl ObjectStoreInner {
+    fn new() -> Self {
+        ObjectStoreInner {
+            id: new_store_id(),
+            casts: Default::default(),
+            metas: Default::default(),
+            metas_by_type: Default::default(),
+            metas_by_cast_target: Default::default(),
+            object_keys: Default::default(),
+            buffers: Default::default(),
+        }
+    }
+
+    fn push<T>(&mut self, buffer_ix: u32, item: T) -> Handle<T>
+    where
+        T: Castable
+    {
+        let meta_ix = *self
+            .metas_by_type
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| {
+                let meta = ObjectMeta::new::<T>();
+                let ix = self.metas.len() as u32;
+                self.metas.push(meta);
+                T::collect_casts(&mut self.casts);
+
+                for (dst, _) in self.casts.find_keys_by_src(TypeId::of::<T>()) {
+                    self.metas_by_cast_target.insert((dst, ix));
+                }
+
+                ix
+            });
+
+        while self.buffers.len() <= buffer_ix as usize {
+            self.buffers.push(Default::default());
+        }
+
+        let buffer = &mut self.buffers[buffer_ix as usize];
+        let (ptr, offset) = buffer.allocate(item);
+
+        self.object_keys.insert(ObjectKey {
+            buffer_ix,
+            meta_ix,
+            offset,
+        });
+
+        Handle {
+            store_id: self.id,
+            meta_ix,
+            ptr,
+        }
+    }
+
+    fn find<'a, T>(&'a self, buffer_ix: u32) -> impl Iterator<Item = Handle<T>> + 'a
+    where
+        T: ?Sized + 'static,
+    {
+        self.find_dynamic(buffer_ix, TypeId::of::<T>())
+            .flat_map(|handle| self.cast_from_dynamic::<T>(handle))
+    }
+
+    fn find_dynamic<'a>(
+        &'a self,
+        buffer_ix: u32,
+        type_id: TypeId,
+    ) -> impl Iterator<Item = DynamicHandle> + 'a {
+        self.metas_by_cast_target
+            .range((type_id, 0)..=(type_id, std::u32::MAX))
+            .flat_map(move |&(_, meta_ix)| {
+                self.object_keys
+                    .range(
+                        ObjectKey {
+                            buffer_ix,
+                            meta_ix,
+                            offset: (0, 0),
+                        }..ObjectKey {
+                            buffer_ix,
+                            meta_ix: 1 + meta_ix,
+                            offset: (0, 0),
+                        },
+                    )
+                    .map(move |key| DynamicHandle {
+                        inner: Handle {
+                            store_id: self.id,
+                            meta_ix: key.meta_ix,
+                            ptr: self.buffers[key.buffer_ix as usize].offset(key.offset),
+                        },
+                    })
+            })
+    }
+
+    fn cast_from_dynamic<T>(&self, handle: DynamicHandle) -> Option<Handle<T>>
+    where
+        T: ?Sized + 'static,
+    {
+        let meta = &self.metas[handle.inner.meta_ix as usize];
+        let cast_ix = self.casts.find_key(meta.type_id, TypeId::of::<T>())?;
+
+        Some(Handle {
+            store_id: handle.inner.store_id,
+            meta_ix: handle.inner.meta_ix,
+            ptr: self.casts.cast(cast_ix, handle.inner.ptr),
+        })
+    }
+
+    fn cast_to_dynamic<T>(&self, handle: Handle<T>) -> DynamicHandle
+    where
+        T: ?Sized + 'static,
+    {
+        assert_eq!(handle.store_id, self.id);
+        DynamicHandle {
+            inner: Handle {
+                meta_ix: handle.meta_ix,
+                store_id: self.id,
+                ptr: handle.ptr as *const (),
+            },
+        }
+    }
+
+    fn cast<T, U>(&self, handle: Handle<T>) -> Option<Handle<U>>
+    where
+        T: ?Sized + 'static,
+        U: ?Sized + 'static,
+    {
+        self.cast_from_dynamic(self.cast_to_dynamic(handle))
+    }
+
+    fn get<T>(&self, handle: Handle<T>) -> &T
+    where
+        T: ?Sized + 'static,
+    {
+        assert_eq!(handle.store_id, self.id);
+
+        // SAFETY: Since we have checked that the handle's store id matches our id, the handle can
+        // only have been acquired from this store instance. Objects within the store are never
+        // removed or moved around in buffers, so reading this type from this handle's pointer is
+        // guaranteed to be valid.
+        unsafe { &*handle.ptr }
+    }
+
+    fn get_mut<T>(&mut self, handle: Handle<T>) -> &mut T
+    where
+        T: ?Sized + 'static,
+    {
+        assert_eq!(handle.store_id, self.id);
+
+        // SAFETY: Since we have checked that the handle's store id matches our id, the handle can
+        // only have been acquired from this store instance. Objects within the store are never
+        // removed or moved around in buffers, so reading this type from this handle's pointer is
+        // guaranteed to be valid.
+        //
+        // It is safe to form the mutable reference because we have a mutable reference to `self`
+        // guaranteeing that nothing else can be referencing anything inside `self`.
+        unsafe { &mut *(handle.ptr as *mut T) }
+    }
+
+    fn get_type_id<T>(&self, handle: Handle<T>) -> TypeId
+    where
+        T: ?Sized,
+    {
+        assert_eq!(handle.store_id, self.id);
+        self.metas[handle.meta_ix as usize].type_id
+    }
+
+    fn get_type_id_dynamic(&self, handle: DynamicHandle) -> TypeId {
+        assert_eq!(handle.inner.store_id, self.id);
+        self.metas[handle.inner.meta_ix as usize].type_id
+    }
+
+    fn get_type_name<T>(&self, handle: Handle<T>) -> &str
+    where
+        T: ?Sized,
+    {
+        assert_eq!(handle.store_id, self.id);
+        self.metas[handle.meta_ix as usize].name.as_str()
+    }
+
+    fn get_type_name_dynamic(&self, handle: DynamicHandle) -> &str {
+        assert_eq!(handle.inner.store_id, self.id);
+        self.metas[handle.inner.meta_ix as usize].name.as_str()
+    }
 }
 
 #[cfg(test)]
