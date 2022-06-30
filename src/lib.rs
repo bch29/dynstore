@@ -45,9 +45,8 @@
 //! whenever an object of a previously-unseen type is pushed. The store is primarily designed for
 //! fast access, searches and casts, not fast allocation.
 //!
-//! Internally, memory is segmented into allocations of size 2MB. This has three main consequences
+//! Internally, memory is segmented into allocations of size 2MB. This has two main consequences
 //! that users need to be aware of:
-//! - Any attempt to push an individual object larger than 2MB to an [`ObjectStore`] will panic.
 //! - If object sizes are a significant fraction of 2MB, memory can be wasted at the end of each
 //! segment.
 //! - At least 2MB will be allocated per buffer index used. If 1000 different buffer indexes are
