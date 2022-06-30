@@ -31,7 +31,7 @@ impl AlignedStorage {
         Chunk { len: 0, data }
     }
 
-    pub fn allocate<T>(&mut self, value: T) -> (*const T, (u32, u32)) {
+    pub fn reserve<T>(&mut self) -> (*mut T, (u32, u32)) {
         let align = std::mem::align_of::<T>();
         let size = std::mem::size_of::<T>();
 
@@ -63,12 +63,20 @@ impl AlignedStorage {
 
         let addr = unsafe { current_chunk.data.offset(offset as isize) as *mut T };
 
-        unsafe {
-            std::ptr::write(addr, value);
-        };
         current_chunk.len = offset + size;
 
         (addr, ((self.chunks.len() - 1) as u32, offset as u32))
+    }
+
+    #[cfg(test)]
+    pub fn allocate<T>(&mut self, value: T) -> (*mut T, (u32, u32)) {
+        let (addr, offset) = self.reserve::<T>();
+
+        unsafe {
+            std::ptr::write(addr, value);
+        };
+
+        (addr, offset)
     }
 
     pub fn offset_mut(&mut self, offset: (u32, u32)) -> *mut () {

@@ -85,8 +85,9 @@ pub mod tag {
 
     /// Converts a tag into a trait bound.
     ///
-    /// SAFETY: it is unsound to implement `Satisfies<Tag> for T` whenever `Tag` implements a trait
-    /// that `T` does not also implement.
+    /// # Safety
+    /// It is unsound to implement `Satisfies<Tag> for T` whenever `Tag` implements a trait that
+    /// `T` does not also implement.
     pub unsafe trait Satisfies<Tag> {}
     unsafe impl<T> Satisfies<ThreadLocal> for T {}
     unsafe impl<T> Satisfies<Send> for T where T: std::marker::Send {}
@@ -100,6 +101,16 @@ pub mod tag {
 pub struct ObjectStore<Tag = tag::Send> {
     _marker: std::marker::PhantomData<Tag>,
     inner: ObjectStoreInner,
+}
+
+/// A partially initialized object store containing potentially uninitialized objects. Supports
+/// reserving slots for data and provides handles. Does not allow access to any contained data
+/// until the store is converted to an [`ObjectStore`] using [`UninitObjectStore::try_init`]. This
+/// is only possible when every handle has been written to.
+pub struct UninitObjectStore<Tag = tag::Send> {
+    _marker: std::marker::PhantomData<Tag>,
+    inner: ObjectStoreInner,
+    unwritten_objects: HashMap<*const (), UninitObjectInfo>,
 }
 
 struct ObjectStoreInner {
@@ -135,11 +146,20 @@ struct ObjectKey {
     offset: (u32, u32),
 }
 
+/// Provides information about an uninitialized object in an [`UninitObjectStore`].
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy)]
+pub struct UninitObjectInfo {
+    pub buffer_ix: u32,
+    meta_ix: u32,
+}
+
 struct ObjectMeta {
     name: String,
     type_id: TypeId,
     destroy: fn(*mut ()),
 }
+
+// ------------------------------------------------------------------------------
 
 impl ObjectStore<tag::ThreadLocal> {
     /// Instantiates a new [`ObjectStore`] object that can store objects which are `!Send` and
@@ -217,7 +237,7 @@ impl<Tag> ObjectStore<Tag> {
     /// associated with this `ObjectStore`.
     pub fn cast_to_dynamic<T>(&self, handle: Handle<T>) -> DynamicHandle
     where
-        T: ?Sized + 'static,
+        T: ?Sized,
     {
         self.inner.cast_to_dynamic(handle)
     }
@@ -285,27 +305,245 @@ impl<Tag> ObjectStore<Tag> {
     }
 }
 
-impl Drop for ObjectStoreInner {
-    fn drop(&mut self) {
-        for key in &self.object_keys {
-            let ptr = self.buffers[key.buffer_ix as usize].offset_mut(key.offset);
-            let meta = &self.metas[key.meta_ix as usize];
-            (meta.destroy)(ptr);
-        }
+/// The object store as `Send` if its tag is `Send` because this ensures that all contained objects
+/// are `Send`.
+unsafe impl<Tag> Send for ObjectStore<Tag> where Tag: Send {}
+
+/// The object store as `Sync` if its tag is `Sync` because this ensures that all contained objects
+/// are `Sync`.
+unsafe impl<Tag> Sync for ObjectStore<Tag> where Tag: Sync {}
+
+// ------------------------------------------------------------------------------
+
+impl UninitObjectStore<tag::ThreadLocal> {
+    /// Instantiates a new [`UninitObjectStore`] object that can store objects which are `!Send` and
+    /// `!Sync`.
+    pub fn new_thread_local() -> Self {
+        Self::new()
     }
 }
 
-// SAFETY: we can mark the object store as Send or Sync if its tag is Send or Sync because the tag
-// places a restriction on the types of objects that can be stored.
-unsafe impl<Tag> Send for ObjectStore<Tag> where Tag: Send {}
-unsafe impl<Tag> Sync for ObjectStore<Tag> where Tag: Sync {}
+impl UninitObjectStore<tag::Send> {
+    /// Instantiates a new [`UninitObjectStore`] object that can store objects which are `Send` but
+    /// `!Sync`.
+    pub fn new_send() -> Self {
+        Self::new()
+    }
+}
 
-// SAFETY: access only happens through the ObjectStore which is only Send or Sync if all objects
-// stored inside it are. Inspecting a handle on another thread is always safe since it is always
-// impossible to access data through an ObjectStore that did not handle out the handle in the first
-// place.
-unsafe impl<T: ?Sized + 'static> Sync for Handle<T> {}
-unsafe impl<T: ?Sized + 'static> Send for Handle<T> {}
+impl UninitObjectStore<tag::SendSync> {
+    /// Instantiates a new [`UninitObjectStore`] object that can store objects which are `Send` and `Sync`.
+    pub fn new_sync() -> Self {
+        Self::new()
+    }
+}
+
+impl<Tag> UninitObjectStore<Tag> {
+    /// Instantiates a new [`UninitObjectStore`] object.
+    pub fn new() -> Self {
+        UninitObjectStore {
+            _marker: std::marker::PhantomData,
+            inner: ObjectStoreInner::new(),
+            unwritten_objects: Default::default(),
+        }
+    }
+
+    /// If every reserved handle has been written to, returns [`Ok`] with an initialized
+    /// [`ObjectStore`].  Otherwise, returns `Err(self)`.
+    pub fn try_init(self) -> Result<ObjectStore<Tag>, UninitObjectStore<Tag>> {
+        if self.unwritten_objects.is_empty() {
+            Ok(ObjectStore {
+                _marker: self._marker,
+                inner: self.inner,
+            })
+        } else {
+            Err(self)
+        }
+    }
+
+    /// Iterates over unwritten handles in this store. Intended mainly for diagnostics.
+    pub fn iter_unwritten_handles<'a>(
+        &'a self,
+    ) -> impl Iterator<Item = (DynamicHandle, UninitObjectInfo)> + 'a {
+        self.unwritten_objects.iter().map(|(&ptr, &info)| {
+            (
+                DynamicHandle {
+                    inner: Handle {
+                        store_id: self.inner.id,
+                        meta_ix: info.meta_ix,
+                        ptr,
+                    },
+                },
+                info,
+            )
+        })
+    }
+
+    /// Returns the number of objects in this store that are yet to be written.
+    pub fn count_unwritten_handles(&self) -> usize {
+        self.unwritten_objects.len()
+    }
+
+    /// Returns true if a call to [`UninitObjectStore::try_init`] will succeed.
+    pub fn can_init(&self) -> bool {
+        self.count_unwritten_handles() == 0
+    }
+
+    /// Pushes a reservation for a new object to the given buffer and returns a handle for it. Any
+    /// [`u32`] can be chosen as the `buffer_ix` but bear in mind that a large choice of index will
+    /// cause a large allocation to happen if smaller buffer indexes have not yet been used. This
+    /// handle must later be written to with [`UninitObjectStore::write`], otherwise initializing
+    /// the store will panic.
+    pub fn reserve<T>(&mut self, buffer_ix: u32) -> Handle<T>
+    where
+        T: Castable + tag::Satisfies<Tag>,
+    {
+        let handle = self.inner.reserve(buffer_ix);
+        self.unwritten_objects.insert(
+            handle.ptr as *const (),
+            UninitObjectInfo {
+                buffer_ix,
+                meta_ix: handle.meta_ix,
+            },
+        );
+        handle
+    }
+
+    /// If the given handle has not already been written to, writes the given value to it.
+    /// Otherwise, panics. Also panics if the handle is not associated with this object store.
+    pub fn write<T>(&mut self, handle: Handle<T>, value: T)
+    where
+        T: Sized,
+    {
+        if !self.try_write(handle, value) {
+            panic!("writing to the same handle twice");
+        }
+    }
+
+    /// If the given handle has not already been written to, writes the given value to it and
+    /// returns `true`. Otherwise, returns `false`. Panics if the handle is not associated with
+    /// this object store.
+    pub fn try_write<T>(&mut self, handle: Handle<T>, value: T) -> bool
+    where
+        T: Sized,
+    {
+        self.unwritten_objects
+            .remove(&(handle.ptr as *const ()))
+            .and_then(|_| {
+                // SAFETY:
+                // a) the T: Sized bound ensures that T is in fact the concrete type of the data,
+                // or at least a type trivially transmutable to it
+                // b) the unwritten_objects check ensures that we can't write to the same handle
+                // twice
+                unsafe {
+                    self.inner.write(handle, value);
+                }
+                Some(())
+            })
+            .is_some()
+    }
+
+    /// Reserves a new object in the given buffer and returns a handle for it. Any [`u32`] can be
+    /// chosen as the `buffer_ix` but bear in mind that a large choice of index will cause a large
+    /// allocation to happen if smaller buffer indexes have not yet been used.
+    pub fn push<T>(&mut self, buffer_ix: u32, item: T) -> Handle<T>
+    where
+        T: Castable + tag::Satisfies<Tag>,
+    {
+        self.inner.push(buffer_ix, item)
+    }
+
+    /// Iterates over handles for all stored objects in the given buffer that are castable to the
+    /// requested type. This is a fast operation implemented as a range lookup in a BTreeSet.
+    pub fn find<'a, T>(&'a self, buffer_ix: u32) -> impl Iterator<Item = Handle<T>> + 'a
+    where
+        T: ?Sized + 'static,
+    {
+        self.inner.find::<T>(buffer_ix)
+    }
+
+    /// Iterates over dynamic handles for all stored objects in the given buffer that are castable
+    /// to the requested type. This is a fast operation implemented as a range lookup in a
+    /// BTreeSet.
+    pub fn find_dynamic<'a>(
+        &'a self,
+        buffer_ix: u32,
+        type_id: TypeId,
+    ) -> impl Iterator<Item = DynamicHandle> + 'a {
+        self.inner.find_dynamic(buffer_ix, type_id)
+    }
+
+    /// Casts an untyped `DynamicHandle` up to a typed `Handle`. Panics if the input handle is not
+    /// associated with this `UninitObjectStore`. Returns `None` if the object that the handle
+    /// points to is not castable to the requested type.
+    pub fn cast_from_dynamic<T>(&self, handle: DynamicHandle) -> Option<Handle<T>>
+    where
+        T: ?Sized + 'static,
+    {
+        self.inner.cast_from_dynamic(handle)
+    }
+
+    /// Casts a handle down to an untyped DynamicHandle. Panics if the input handle is not
+    /// associated with this `UninitObjectStore`.
+    pub fn cast_to_dynamic<T>(&self, handle: Handle<T>) -> DynamicHandle
+    where
+        T: ?Sized,
+    {
+        self.inner.cast_to_dynamic(handle)
+    }
+
+    /// Casts a handle to a different type. Panics if the input handle is not associated with this
+    /// `UninitObjectStore`. Returns `None` if the concrete type pointed to by the input handle is
+    /// not castable to `U`.
+    pub fn cast<T, U>(&self, handle: Handle<T>) -> Option<Handle<U>>
+    where
+        T: ?Sized + 'static,
+        U: ?Sized + 'static,
+    {
+        self.inner.cast(handle)
+    }
+
+    /// Returns the [`TypeId`] of the concrete type stored at the given handle. The returned type
+    /// id will not match `T` if `T` is a trait object type. Panics if the input handle is not
+    /// associated with this `UninitObjectStore`.
+    pub fn get_type_id<T>(&self, handle: Handle<T>) -> TypeId
+    where
+        T: ?Sized,
+    {
+        self.inner.get_type_id(handle)
+    }
+
+    /// Returns the [`TypeId`] of the concrete type stored at the given handle. Panics if the input
+    /// handle is not associated with this `UninitObjectStore`.
+    pub fn get_type_id_dynamic(&self, handle: DynamicHandle) -> TypeId {
+        self.inner.get_type_id_dynamic(handle)
+    }
+
+    /// Gets the name of the type stored at the given handle. Panics if the input handle is not
+    /// associated with this `UninitObjectStore`.
+    pub fn get_type_name<T>(&self, handle: Handle<T>) -> &str
+    where
+        T: ?Sized,
+    {
+        self.inner.get_type_name(handle)
+    }
+
+    /// Gets the name of the type stored at the given dynamic handle. Panics if the input handle is
+    /// not associated with this `UninitObjectStore`.
+    pub fn get_type_name_dynamic(&self, handle: DynamicHandle) -> &str {
+        self.inner.get_type_name_dynamic(handle)
+    }
+}
+
+/// An uninit object store as `Send` as long as its tag is `Send` because the tag ensures that all
+/// stored objects are `Send`.
+unsafe impl<Tag> Send for UninitObjectStore<Tag> where Tag: Send {}
+
+/// An uninit object store can be safely accessed from any thread regardless of its tag because
+/// objects inside it cannot be accessed while it is uninitialized.
+unsafe impl<Tag> Sync for UninitObjectStore<Tag> {}
+
+// ------------------------------------------------------------------------------
 
 impl ObjectMeta {
     fn new<T>() -> Self
@@ -321,6 +559,15 @@ impl ObjectMeta {
         }
     }
 }
+
+// ------------------------------------------------------------------------------
+
+// SAFETY: access only happens through the ObjectStore which is only Send or Sync if all objects
+// stored inside it are. Inspecting a handle on another thread is always safe since it is always
+// impossible to access data through an ObjectStore that did not handle out the handle in the first
+// place.
+unsafe impl<T: ?Sized + 'static> Sync for Handle<T> {}
+unsafe impl<T: ?Sized + 'static> Send for Handle<T> {}
 
 impl<T> Clone for Handle<T>
 where
@@ -392,15 +639,7 @@ where
     }
 }
 
-/// SAFETY: it is only safe to call this when the object that `ptr` points to is an instance of `T`
-/// and it will not be dropped again.
-unsafe fn destroy<T>(ptr: *mut ())
-where
-    T: Sized,
-{
-    let ptr = ptr as *mut T;
-    std::ptr::drop_in_place(ptr);
-}
+// ------------------------------------------------------------------------------
 
 fn new_store_id() -> u32 {
     static NEXT_ID: once_cell::sync::OnceCell<Mutex<u32>> = once_cell::sync::OnceCell::new();
@@ -432,9 +671,9 @@ impl ObjectStoreInner {
         }
     }
 
-    fn push<T>(&mut self, buffer_ix: u32, item: T) -> Handle<T>
+    fn reserve<T>(&mut self, buffer_ix: u32) -> Handle<T>
     where
-        T: Castable
+        T: Castable,
     {
         let meta_ix = *self
             .metas_by_type
@@ -457,7 +696,7 @@ impl ObjectStoreInner {
         }
 
         let buffer = &mut self.buffers[buffer_ix as usize];
-        let (ptr, offset) = buffer.allocate(item);
+        let (ptr, offset) = buffer.reserve::<T>();
 
         self.object_keys.insert(ObjectKey {
             buffer_ix,
@@ -470,6 +709,29 @@ impl ObjectStoreInner {
             meta_ix,
             ptr,
         }
+    }
+
+    // SAFETY:
+    // a) T must be the concrete type of the provided handle
+    // b) the handle must not have been written to already
+    unsafe fn write<T: Sized>(&mut self, handle: Handle<T>, item: T) {
+        let addr = handle.ptr as *mut T;
+        std::ptr::write(addr, item);
+    }
+
+    fn push<T>(&mut self, buffer_ix: u32, item: T) -> Handle<T>
+    where
+        T: Castable,
+    {
+        let handle = self.reserve::<T>(buffer_ix);
+
+        // SAFETY: reserve() guarantees that the returned pointer is a suitable memory location to
+        // write an object of type T and that no references to that memory exist yet.
+        unsafe {
+            self.write(handle, item);
+        }
+
+        handle
     }
 
     fn find<'a, T>(&'a self, buffer_ix: u32) -> impl Iterator<Item = Handle<T>> + 'a
@@ -500,14 +762,18 @@ impl ObjectStoreInner {
                             offset: (0, 0),
                         },
                     )
-                    .map(move |key| DynamicHandle {
-                        inner: Handle {
-                            store_id: self.id,
-                            meta_ix: key.meta_ix,
-                            ptr: self.buffers[key.buffer_ix as usize].offset(key.offset),
-                        },
-                    })
+                    .map(move |&key| self.key_to_handle(key))
             })
+    }
+
+    fn key_to_handle(&self, key: ObjectKey) -> DynamicHandle {
+        DynamicHandle {
+            inner: Handle {
+                store_id: self.id,
+                meta_ix: key.meta_ix,
+                ptr: self.buffers[key.buffer_ix as usize].offset(key.offset),
+            },
+        }
     }
 
     fn cast_from_dynamic<T>(&self, handle: DynamicHandle) -> Option<Handle<T>>
@@ -526,7 +792,7 @@ impl ObjectStoreInner {
 
     fn cast_to_dynamic<T>(&self, handle: Handle<T>) -> DynamicHandle
     where
-        T: ?Sized + 'static,
+        T: ?Sized,
     {
         assert_eq!(handle.store_id, self.id);
         DynamicHandle {
@@ -602,11 +868,35 @@ impl ObjectStoreInner {
     }
 }
 
+impl Drop for ObjectStoreInner {
+    fn drop(&mut self) {
+        for key in &self.object_keys {
+            let ptr = self.buffers[key.buffer_ix as usize].offset_mut(key.offset);
+            let meta = &self.metas[key.meta_ix as usize];
+            (meta.destroy)(ptr);
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------
+
+/// SAFETY: it is only safe to call this when the object that `ptr` points to is an instance of `T`
+/// and it will not be dropped again.
+unsafe fn destroy<T>(ptr: *mut ())
+where
+    T: Sized,
+{
+    let ptr = ptr as *mut T;
+    std::ptr::drop_in_place(ptr);
+}
+
+// ------------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use std::any::TypeId;
 
-    use super::ObjectStore;
+    use super::{Handle, ObjectStore, UninitObjectStore};
 
     trait Object {}
 
@@ -664,6 +954,121 @@ mod tests {
                 b: 1,
             },
         );
+
+        check_store_contents(
+            &store,
+            TestHandles {
+                handle0,
+                handle1,
+                handle2,
+                handle3,
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_invalid_object_store() {
+        let mut store1 = ObjectStore::new_send();
+        let store2 = ObjectStore::new_send();
+
+        let handle = store1.push(
+            0,
+            MyObjectA {
+                a: "test".to_string(),
+                b: 4,
+            },
+        );
+
+        // access through a handle that was assigned from a different store panics in order to
+        // prevent invalid memory acess
+        store2.get(handle);
+    }
+
+    #[test]
+    fn test_uninit_object_store() {
+        let mut store = UninitObjectStore::new_thread_local();
+
+        let handle0 = store.reserve::<MyObjectA>(0);
+        let handle1 = store.push(0, MyObjectB { x: 0 });
+        let handle2 = store.reserve::<MyObjectA>(2);
+        let handle3 = store.reserve::<MyObjectA>(0);
+
+        assert_eq!(store.count_unwritten_handles(), 3);
+        let mut store = match store.try_init() {
+            Ok(_) => panic!("store should not yet be initializable"),
+            Err(store) => store,
+        };
+
+        store.write(
+            handle0,
+            MyObjectA {
+                a: "test".to_string(),
+                b: 4,
+            },
+        );
+        assert_eq!(store.count_unwritten_handles(), 2);
+
+        // cannot write to the same handle twice
+        assert!(!store.try_write(
+            handle0,
+            MyObjectA {
+                a: "test".to_string(),
+                b: 4,
+            },
+        ));
+        assert!(!store.try_write(handle1, MyObjectB { x: 0 }));
+        assert_eq!(store.count_unwritten_handles(), 2);
+
+        store.write(
+            handle2,
+            MyObjectA {
+                a: "bar".to_string(),
+                b: 8,
+            },
+        );
+        assert!(store.try_write(
+            handle3,
+            MyObjectA {
+                a: "baz".to_string(),
+                b: 1,
+            },
+        ));
+        assert_eq!(store.count_unwritten_handles(), 0);
+        assert!(store.can_init());
+
+        let store = match store.try_init() {
+            Ok(store) => store,
+            Err(_) => {
+                panic!("store should be initializable after all handles have been written to")
+            }
+        };
+
+        check_store_contents(
+            &store,
+            TestHandles {
+                handle0,
+                handle1,
+                handle2,
+                handle3,
+            },
+        );
+    }
+
+    struct TestHandles {
+        handle0: Handle<MyObjectA>,
+        handle1: Handle<MyObjectB>,
+        handle2: Handle<MyObjectA>,
+        handle3: Handle<MyObjectA>,
+    }
+
+    fn check_store_contents<Tag>(store: &ObjectStore<Tag>, handles: TestHandles) {
+        let TestHandles {
+            handle0,
+            handle1,
+            handle2,
+            handle3,
+        } = handles;
 
         // `get` allows access through handles
         assert_eq!(
@@ -755,24 +1160,5 @@ mod tests {
                 store.cast_to_dynamic(handle1)
             );
         }
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_invalid_object_store() {
-        let mut store1 = ObjectStore::new_send();
-        let store2 = ObjectStore::new_send();
-
-        let handle = store1.push(
-            0,
-            MyObjectA {
-                a: "test".to_string(),
-                b: 4,
-            },
-        );
-
-        // access through a handle that was assigned from a different store panics in order to
-        // prevent invalid memory acess
-        store2.get(handle);
     }
 }
