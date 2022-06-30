@@ -1,6 +1,6 @@
 [package]
 name = "dynstore"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A container for arbitrary castable objects"
 license = "MIT"
@@ -15,3 +15,6 @@ once_cell = "1.*"
 
 [features]
 inventory = ["dep:inventory"]
+
+[package.metadata.docs.rs]
+features = ["inventory"]
